@@ -2,7 +2,7 @@
 
 A professional Blender addon for generating hair as actual mesh geometry, perfect for game development and GLB exports. Bypasses Blender's particle system limitations to create exportable hair with perfect material inheritance.
 
-![Version](https://img.shields.io/badge/version-13.0-brightgreen)
+![Version](https://img.shields.io/badge/version-15.0-brightgreen)
 ![Blender](https://img.shields.io/badge/blender-4.4.3+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
