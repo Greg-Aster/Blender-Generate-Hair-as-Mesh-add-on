@@ -172,7 +172,7 @@ class MeshHairProperties(bpy.types.PropertyGroup):
         name="Count", 
         default=10000, 
         min=1, 
-        max=100000,
+        max=1000000,
         description="Number of hair strands to generate"
     )
     
@@ -328,6 +328,12 @@ class MeshHairProperties(bpy.types.PropertyGroup):
         name="Align to Surface",
         default=True,
         description="Align instance objects to surface normal"
+    )
+    
+    use_instance_materials: BoolProperty(
+        name="Use Instance Materials",
+        default=True,
+        description="Use the instance object's original materials instead of inheriting from emitter surface"
     )
     
     # --- Hair Card Settings ---
@@ -511,7 +517,7 @@ class MeshHairProperties(bpy.types.PropertyGroup):
         name="Children Radius",
         default=0.02,
         min=0.001,
-        max=0.1,
+        max=1.0,
         description="Radius around parent for child placement"
     )
     

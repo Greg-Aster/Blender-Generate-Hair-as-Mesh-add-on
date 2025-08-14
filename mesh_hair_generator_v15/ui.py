@@ -105,6 +105,7 @@ class MESH_HAIR_PT_Panel(bpy.types.Panel):
             
             obj_box.prop(props, "object_rotation_random")
             obj_box.prop(props, "align_to_normal")
+            obj_box.prop(props, "use_instance_materials")
         
         elif props.render_type == 'HAIR_CARDS':
             card_box = layout.box()

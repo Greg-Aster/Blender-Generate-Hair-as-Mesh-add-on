@@ -177,8 +177,12 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
         total_expected = hair_count
         if props.use_children:
             total_expected += hair_count * props.children_count
+        
+        # Get emitter material count for proper material index offsetting
+        emitter_material_count = len(hair_obj.data.materials)
+        
         self.update_progress(context, f"Calculating geometry for {total_expected:,} hair strands...")
-        hair_data = self.calculate_all_hair_geometry(points_data, props, emitter, context)
+        hair_data = self.calculate_all_hair_geometry(points_data, props, emitter, context, emitter_material_count)
         
         # Create mesh from calculated data (bulk operation)
         self.update_progress(context, f"Building mesh: {len(hair_data['vertices']):,} vertices, {len(hair_data['faces']):,} faces...")
@@ -197,6 +201,11 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
         
         # Cleanup evaluated mesh
         eval_obj.to_mesh_clear()
+        
+        # Apply instance materials if using OBJECT render type
+        if props.render_type == 'OBJECT' and props.use_instance_materials and props.instance_object:
+            self.update_progress(context, "Merging instance materials...")
+            self.merge_instance_materials(hair_obj, props.instance_object, props.keep_emitter_geometry)
         
         # Create appropriate material for hair cards
         if props.render_type == 'HAIR_CARDS':
@@ -217,7 +226,7 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
         self.report({'INFO'}, f"Generated hair with perfect material inheritance")
         return hair_obj
     
-    def calculate_all_hair_geometry(self, points_data, props, emitter, context):
+    def calculate_all_hair_geometry(self, points_data, props, emitter, context, emitter_material_count):
         """
         Calculate all hair geometry data without modifying bmesh.
         This is the new high-performance approach that separates calculation from creation.
@@ -367,15 +376,21 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
             radii = self.calculate_hair_radii(len(path_points), props, is_child)
             
             # 2. Get Material Index (Preserving Inheritance)
-            # This is inherited from the original emitter face
+            # Skip emitter material inheritance for OBJECT render type when using instance materials
             material_index = 0
-            if point_data.get('face_index') is not None:
-                source_face_idx = point_data['face_index']
-                if source_face_idx < len(emitter.data.polygons):
-                    material_index = emitter.data.polygons[source_face_idx].material_index
+            if not (props.render_type == 'OBJECT' and props.use_instance_materials):
+                # Only inherit from emitter when NOT using pure instance materials
+                if point_data.get('face_index') is not None:
+                    source_face_idx = point_data['face_index']
+                    if source_face_idx < len(emitter.data.polygons):
+                        material_index = emitter.data.polygons[source_face_idx].material_index
             
             # 3. Get UV Coordinate for texture sampling
-            source_uv = point_data.get('uv_coord')
+            # Skip emitter UV sampling for OBJECT render type when using instance materials
+            source_uv = None
+            if not (props.render_type == 'OBJECT' and props.use_instance_materials):
+                # Only use emitter UV when NOT using pure instance materials
+                source_uv = point_data.get('uv_coord')
             
             # 4. Generate Vertices and Faces based on render type
             if props.render_type == 'TUBES':
@@ -501,7 +516,7 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
                 # Generate instance geometry data
                 self.calculate_instance_geometry_data(
                     all_vertices, all_faces, all_material_indices, all_uv_coords,
-                    props.instance_object, transform_matrix, material_index, source_uv
+                    props.instance_object, transform_matrix, material_index, source_uv, props, emitter_material_count
                 )
             
             elif props.render_type == 'HAIR_CARDS':
@@ -549,18 +564,29 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
     
     def calculate_instance_geometry_data(self, all_vertices, all_faces, all_material_indices, 
                                        all_uv_coords, instance_obj, transform_matrix, 
-                                       material_index, source_uv):
-        """Calculate transformed instance object geometry data"""
+                                       material_index, source_uv, props, emitter_material_count):
+        """Calculate transformed instance geometry data with proper material index offsetting"""
         instance_mesh = instance_obj.data
         vertex_offset = len(all_vertices)
         
-        # Transform and add vertices
-        for vert in instance_mesh.vertices:
+        # Get instance object's UV layer if using instance materials
+        instance_uv_layer = None
+        if props.use_instance_materials and instance_mesh.uv_layers.active:
+            instance_uv_layer = instance_mesh.uv_layers.active.data
+        
+        # --- Transform and add vertices ---
+        for vert_idx, vert in enumerate(instance_mesh.vertices):
+            # Apply the transformation matrix (includes scale, rotation, and translation)
             transformed_pos = transform_matrix @ vert.co
             all_vertices.append(transformed_pos)
             
             # Add UV coordinate for this vertex
-            if source_uv:
+            if props.use_instance_materials and instance_uv_layer:
+                # Use the instance object's own UV coordinates - need to find UV from loops
+                # For now, use a default UV and we'll set proper UVs in the face loop
+                all_uv_coords.append(Vector((0, 0)))
+            elif source_uv:
+                # Use emitter UV with variation (existing behavior)
                 uv_variation = 0.01
                 offset_u = random.uniform(-uv_variation, uv_variation)
                 offset_v = random.uniform(-uv_variation, uv_variation)
@@ -573,20 +599,48 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
             else:
                 all_uv_coords.append(Vector((0, 0)))
         
-        # Add faces with proper vertex indices
+        # --- Add faces with proper material indices and UV coordinates ---
         for poly in instance_mesh.polygons:
+            # Determine which material index to use
+            if props.use_instance_materials:
+                # Use the instance object's original material index with proper offsetting
+                # This prevents collision with emitter material indices
+                face_material_index = poly.material_index + emitter_material_count
+            else:
+                # Use the emitter surface material (existing behavior)
+                face_material_index = material_index
+            
             if len(poly.vertices) == 3:
                 # Triangle face
                 face = tuple(vertex_offset + v for v in poly.vertices)
                 all_faces.append(face)
-                all_material_indices.append(material_index)
+                all_material_indices.append(face_material_index)
+                
+                # Update UV coordinates from instance object if using instance materials
+                if props.use_instance_materials and instance_uv_layer:
+                    for i, loop_idx in enumerate(poly.loop_indices):
+                        vert_idx = vertex_offset + poly.vertices[i]
+                        if vert_idx < len(all_uv_coords):
+                            # Get UV coordinate from instance object's UV layer
+                            uv_coord = Vector(instance_uv_layer[loop_idx].uv)
+                            all_uv_coords[vert_idx] = uv_coord
+                            
             elif len(poly.vertices) == 4:
                 # Quad face - split into two triangles
                 v = poly.vertices
                 face1 = (vertex_offset + v[0], vertex_offset + v[1], vertex_offset + v[2])
                 face2 = (vertex_offset + v[0], vertex_offset + v[2], vertex_offset + v[3])
                 all_faces.extend([face1, face2])
-                all_material_indices.extend([material_index, material_index])
+                all_material_indices.extend([face_material_index, face_material_index])
+                
+                # Update UV coordinates from instance object if using instance materials
+                if props.use_instance_materials and instance_uv_layer:
+                    for i, loop_idx in enumerate(poly.loop_indices):
+                        vert_idx = vertex_offset + poly.vertices[i]
+                        if vert_idx < len(all_uv_coords):
+                            # Get UV coordinate from instance object's UV layer
+                            uv_coord = Vector(instance_uv_layer[loop_idx].uv)
+                            all_uv_coords[vert_idx] = uv_coord
     
     def calculate_hair_card_geometry_data(self, all_vertices, all_faces, all_material_indices,
                                         all_uv_coords, start_pos, hair_dir, surface_normal,
@@ -963,6 +1017,114 @@ class MESH_HAIR_OT_Generate(bpy.types.Operator):
             radii.append(radius)
         
         return radii
+    
+    def merge_instance_materials(self, hair_obj, instance_obj, keep_emitter_geometry):
+        """Handle instance materials with proper offsetting - much simpler now"""
+        if not instance_obj or not instance_obj.data or not instance_obj.data.materials:
+            return
+        
+        if keep_emitter_geometry:
+            # Simply append instance materials to the end of the emitter materials
+            # The offsetted indices from geometry calculation will automatically point to these
+            existing_material_count = len(hair_obj.data.materials)
+            
+            for inst_mat in instance_obj.data.materials:
+                hair_obj.data.materials.append(inst_mat)
+            
+            print(f"Added {len(instance_obj.data.materials)} instance materials (preserving {existing_material_count} emitter materials)")
+            
+        else:
+            # No emitter geometry - replace all materials with instance materials
+            original_emitter_material_count = len(hair_obj.data.materials)
+            hair_obj.data.materials.clear()
+            
+            for inst_mat in instance_obj.data.materials:
+                hair_obj.data.materials.append(inst_mat)
+            
+            # Need to adjust material indices since we removed emitter materials
+            # All instance faces should now point to indices 0, 1, 2... instead of offset indices
+            for poly in hair_obj.data.polygons:
+                if poly.material_index >= original_emitter_material_count:
+                    poly.material_index -= original_emitter_material_count
+            
+            print(f"Replaced materials with {len(instance_obj.data.materials)} instance materials")
+    
+    def prune_original_geometry(self, hair_obj, original_face_count):
+        """Remove the original emitter geometry from the hair object"""
+        mesh = hair_obj.data
+        
+        # Create bmesh instance
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        
+        # Remove faces from the beginning (original emitter faces)
+        faces_to_remove = []
+        for i, face in enumerate(bm.faces):
+            if i < original_face_count:
+                faces_to_remove.append(face)
+        
+        for face in faces_to_remove:
+            bm.faces.remove(face)
+        
+        # Find all vertices that are not connected to any faces
+        loose_verts = [v for v in bm.verts if not v.link_faces]
+        if loose_verts:
+            # Delete the loose vertices
+            bmesh.ops.delete(bm, geom=loose_verts, context='VERTS')
+        
+        # Remove unused vertices (this can now be removed or kept for extra cleanup)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        
+        # Update mesh
+        bm.to_mesh(mesh)
+        mesh.update()
+        bm.free()
+        
+        print(f"Pruned {original_face_count} original faces from hair mesh")
+    
+    def create_hair_card_material(self, hair_obj, props):
+        """Create or assign material for hair cards"""
+        if not props.hair_card_texture:
+            # Create a simple material if no texture is provided
+            mat = bpy.data.materials.new(name="HairCard_Material")
+            mat.use_nodes = True
+            
+            # Get the principled BSDF node
+            bsdf = mat.node_tree.nodes["Principled BSDF"]
+            bsdf.inputs["Base Color"].default_value = props.hair_color
+            bsdf.inputs["Alpha"].default_value = 0.8
+            
+            # Enable alpha blend
+            mat.blend_method = 'BLEND'
+            
+            # Add material to hair object
+            hair_obj.data.materials.append(mat)
+        else:
+            # Create material with the provided texture
+            mat = bpy.data.materials.new(name="HairCard_Textured")
+            mat.use_nodes = True
+            
+            # Get nodes
+            bsdf = mat.node_tree.nodes["Principled BSDF"]
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            
+            # Add image texture node
+            tex_node = nodes.new(type='ShaderNodeTexImage')
+            tex_node.image = props.hair_card_texture
+            tex_node.location = (-300, 0)
+            
+            # Connect texture to BSDF
+            links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+            links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+            
+            # Enable alpha blend
+            mat.blend_method = 'BLEND'
+            
+            # Add material to hair object
+            hair_obj.data.materials.append(mat)
+        
+        print(f"Created hair card material for hair object")
     
 class MESH_HAIR_OT_Finalize(bpy.types.Operator):
     bl_idname = "mesh_hair.finalize"
